@@ -565,8 +565,10 @@ class SessionManager:
         User-approved recovery for stale tracking (the divergence notice's
         button). Updates every key for this window_id; the monitor observes
         the change on its next poll, drops the old session, and starts
-        tracking the new one at end-of-file. Returns False when no entry
-        exists for the window.
+        tracking the new one at end-of-file. The old session's
+        transcript_size_at_start is dropped with it: left in place, it would
+        seed the new session's read offset and replay its whole transcript.
+        Returns False when no entry exists for the window.
         """
         repointed = False
 
@@ -576,6 +578,7 @@ class SessionManager:
                 parts = self._split_session_map_key(key)
                 if parts is not None and parts[1] == window_id:
                     info["session_id"] = session_id
+                    info.pop("transcript_size_at_start", None)
                     repointed = True
             if repointed:
                 logger.info("Re-pointed window %s -> session %s", window_id, session_id)

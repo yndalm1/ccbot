@@ -13,7 +13,8 @@ Steps (each independently guarded, one failure never blocks the others):
   - divergence notices: a bound window whose tracked transcript has frozen
     while a different, untracked transcript grows in the same project
     directory has probably had its session re-created behind ccbot's back
-    (the 2026-07-04 daemon incident signature). Post a notice with a
+    (the 2026-07-04 daemon incident signature). A tracked transcript that
+    never appeared on disk counts as frozen too. Post a notice with a
     human-approved "Re-point" button — never rebind automatically.
 
 Key components: MAINTENANCE_INTERVAL, run_maintenance_once(), maintenance_loop().
@@ -59,6 +60,9 @@ _hook_failures_offset: int | None = None
 
 # window_id -> divergence episode: {"sid", "size", "ticks", "notified"}
 _divergence: dict[str, dict[str, Any]] = {}
+
+# window_id -> (tracked session_id, when its transcript was first seen missing)
+_missing_since: dict[str, tuple[str, float]] = {}
 
 
 def _hook_failures_file() -> Path:
@@ -207,15 +211,31 @@ async def _check_divergence(bot: Bot) -> None:
             continue
 
         tracked = monitor_state.get_session(ws.session_id)
-        if tracked is None:
+        if tracked is not None:
+            tracked_path: Path | None = Path(tracked.file_path)
+        else:
+            tracked_path = session_manager._build_session_file_path(
+                ws.session_id, ws.cwd
+            )
+        if tracked_path is None:
             _divergence.pop(window_id, None)
             continue
-        tracked_path = Path(tracked.file_path)
         try:
             tracked_mtime = tracked_path.stat().st_mtime
+            tracked_missing = False
+            _missing_since.pop(window_id, None)
         except OSError:
-            _divergence.pop(window_id, None)
-            continue
+            # A transcript that never appeared on disk (a mapping stolen by a
+            # `claude -p --no-session-persistence` child) is frozen from the
+            # moment it was first seen missing. A fresh session writes its
+            # transcript only with its first message, so the same quiet
+            # period applies before it counts.
+            seen = _missing_since.get(window_id)
+            if seen is None or seen[0] != ws.session_id:
+                seen = (ws.session_id, now)
+                _missing_since[window_id] = seen
+            tracked_mtime = seen[1]
+            tracked_missing = True
         if now - tracked_mtime < DIVERGENCE_FROZEN_AFTER:
             _divergence.pop(window_id, None)
             continue
@@ -255,6 +275,7 @@ async def _check_divergence(bot: Bot) -> None:
                 tracked_sid=ws.session_id,
                 candidate_sid=cand_sid,
                 frozen_secs=now - tracked_mtime,
+                tracked_missing=tracked_missing,
             )
 
 
@@ -267,12 +288,17 @@ async def _send_divergence_notice(
     tracked_sid: str,
     candidate_sid: str,
     frozen_secs: float,
+    tracked_missing: bool = False,
 ) -> None:
     """One notice per episode: stale tracking suspected, re-point on approval."""
     minutes = int(frozen_secs // 60)
+    if tracked_missing:
+        tracked_state = f"has had no transcript on disk for {minutes} min"
+    else:
+        tracked_state = f"last wrote {minutes} min ago"
     text = (
         "⚠️ Session tracking for this window may be stale.\n"
-        f"Tracked session {tracked_sid[:8]}… last wrote {minutes} min ago, "
+        f"Tracked session {tracked_sid[:8]}… {tracked_state}, "
         f"while {candidate_sid[:8]}… is actively writing in the same "
         "directory.\n"
         "If this window's conversation moved (e.g. /clear or resume), tap "

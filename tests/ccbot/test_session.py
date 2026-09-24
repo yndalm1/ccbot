@@ -403,6 +403,33 @@ class TestGroupedSessionMapHandling:
         assert result["ccbot:@49"]["session_id"] == "sid-49"
 
     @pytest.mark.asyncio
+    async def test_repoint_drops_old_session_start_size(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """The old session's start size would seed the new session's read
+        offset (0 = replay the whole transcript); without it the monitor
+        starts at end-of-file."""
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@41": {
+                        "session_id": "sid-old",
+                        "cwd": "/proj",
+                        "transcript_size_at_start": 0,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+
+        await mgr.repoint_window_session("@41", "sid-new")
+
+        result = json.loads(session_map_file.read_text(encoding="utf-8"))
+        assert result["ccbot:@41"] == {"session_id": "sid-new", "cwd": "/proj"}
+
+    @pytest.mark.asyncio
     async def test_repoint_returns_false_when_window_absent(
         self, mgr: SessionManager, tmp_path, monkeypatch
     ) -> None:

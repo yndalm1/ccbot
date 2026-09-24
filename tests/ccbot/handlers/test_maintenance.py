@@ -17,9 +17,11 @@ from ccbot.config import config
 def _reset_module_state():
     maintenance._hook_failures_offset = None
     maintenance._divergence.clear()
+    maintenance._missing_since.clear()
     yield
     maintenance._hook_failures_offset = None
     maintenance._divergence.clear()
+    maintenance._missing_since.clear()
 
 
 def _fake_session_manager(bindings, window_states):
@@ -321,6 +323,70 @@ class TestDivergenceDetection:
 
         mock_safe_send.assert_not_called()
         assert maintenance._divergence == {}
+
+    def _setup_missing(self, tmp_path, monkeypatch):
+        """Window tracks a session whose transcript never reached disk (a
+        mapping stolen by a `claude -p --no-session-persistence` child), while
+        the window's real transcript keeps growing next door."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        candidate = proj / "sid-real.jsonl"
+        candidate.write_text("{}\n")
+        monitor_state_file = tmp_path / "monitor_state.json"
+        monitor_state_file.write_text(json.dumps({"tracked_sessions": {}}))
+        monkeypatch.setattr(config, "monitor_state_file", monitor_state_file)
+        sm = _fake_session_manager(
+            bindings=[(1, 42, "@41")],
+            window_states={"@41": SimpleNamespace(session_id="sid-ghost", cwd="/proj")},
+        )
+        sm._build_session_file_path = lambda sid, cwd: proj / f"{sid}.jsonl"
+        return candidate, sm
+
+    @pytest.mark.asyncio
+    async def test_missing_transcript_counts_as_frozen_after_quiet_period(
+        self, tmp_path, monkeypatch
+    ):
+        candidate, sm = self._setup_missing(tmp_path, monkeypatch)
+        maintenance._missing_since["@41"] = ("sid-ghost", time.time() - 600)
+        bot = AsyncMock()
+
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
+            await maintenance._check_divergence(bot)
+            self._grow(candidate)
+            await maintenance._check_divergence(bot)
+
+        mock_safe_send.assert_called_once()
+        args, kwargs = mock_safe_send.call_args
+        assert "no transcript on disk" in args[2]
+        button = kwargs["reply_markup"].inline_keyboard[0][0]
+        assert button.callback_data == "rp:@41:sid-real"
+
+    @pytest.mark.asyncio
+    async def test_newly_missing_transcript_waits_out_quiet_period(
+        self, tmp_path, monkeypatch
+    ):
+        """A fresh session has no transcript until its first message, so a
+        just-noticed missing file must not fire even beside a growing sibling."""
+        candidate, sm = self._setup_missing(tmp_path, monkeypatch)
+        bot = AsyncMock()
+
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
+            await maintenance._check_divergence(bot)
+            self._grow(candidate)
+            await maintenance._check_divergence(bot)
+
+        mock_safe_send.assert_not_called()
+        assert maintenance._missing_since["@41"][0] == "sid-ghost"
 
     @pytest.mark.asyncio
     async def test_retryafter_is_logged_and_swallowed(self, tmp_path, monkeypatch):
