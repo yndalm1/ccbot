@@ -3,7 +3,9 @@
 Called by Claude Code's SessionStart hook to maintain a window↔session
 mapping in <CCBOT_DIR>/session_map.json. Skips panes belonging to a foreign
 tmux session sharing ccbot's dedicated socket (e.g. the user's own
-interactive tmux sessions), so their entries never pollute the map. Also
+interactive tmux sessions), so their entries never pollute the map, and
+skips claude sessions that cannot own a window: non-interactive ones
+(`claude -p`, SDK hosts) and ones nested inside another claude. Also
 provides `--install` to auto-configure the hook in ~/.claude/settings.json.
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
@@ -470,6 +472,21 @@ def hook_main() -> None:
         logger.debug("Ignoring non-SessionStart event: %s", event)
         return
 
+    # Only an interactive session can own a window. A non-interactive one
+    # (`claude -p`, an SDK host) started from inside a pane inherits
+    # TMUX_PANE and would steal the window's mapping; with
+    # --no-session-persistence its transcript never exists, so the topic
+    # goes silent. Claude Code sets CLAUDE_CODE_ENTRYPOINT for its own hooks
+    # ("cli" for the TUI, "sdk-cli" for `-p`, "sdk-*" for SDK hosts),
+    # independent of how the process was launched. Unset fails open.
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    if entrypoint.startswith("sdk"):
+        logger.info(
+            "Hook fired by a non-interactive claude (entrypoint %s); not registering",
+            entrypoint,
+        )
+        return
+
     # Get tmux session:window key for the pane running this hook.
     # TMUX_PANE is set by tmux for every process inside a pane. Daemon-hosted
     # sessions (claude --bg-pty-host …) strip it, so fall back to matching the
@@ -480,13 +497,15 @@ def hook_main() -> None:
     pane_id = os.environ.get("TMUX_PANE", "")
     by_cwd_fallback = False
     if pane_id:
-        # A child claude spawned from inside the pane (a tool shelling out
-        # to `claude -p`) inherits TMUX_PANE and reaches this path looking
-        # exactly like the pane's own session — its SessionStart would
-        # steal the window's mapping and the topic would go silent until
-        # the divergence notice. The pane's own session runs this hook
-        # under exactly one claude ancestor; a child session under two or
-        # more. Skip those; unknown (None) fails open.
+        # A child claude spawned from inside the pane inherits TMUX_PANE and
+        # reaches this path looking exactly like the pane's own session —
+        # its SessionStart would steal the window's mapping and the topic
+        # would go silent until the divergence notice. The entrypoint check
+        # above catches non-interactive children; this catches the rest.
+        # The pane's own session runs this hook under exactly one claude
+        # ancestor; a child session under two or more. Skip those; unknown
+        # (None) fails open. The count only sees processes named "claude":
+        # one launched by its versioned path shows as e.g. "2.1.280".
         claude_ancestors = _count_claude_ancestors()
         if claude_ancestors is not None and claude_ancestors >= 2:
             logger.info(
