@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ccbot.bot import _media_blocked_by_ui, photo_handler, voice_handler
+from ccbot.bot import _media_blocked_by_ui, image_handler, voice_handler
 
 
 class TestMediaBlockedByUiHelper:
@@ -86,6 +86,7 @@ def _make_update_with_photo(user_id: int = 1, thread_id: int = 42) -> MagicMock:
     update.effective_user.id = user_id
     update.message = MagicMock()
     photo = MagicMock()
+    photo.file_size = 1000
     photo.get_file = AsyncMock()
     update.message.photo = [photo]
     update.message.caption = None
@@ -135,7 +136,7 @@ class TestPhotoHandlerBlockedByUi:
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
             mock_tmux.capture_pane = AsyncMock(return_value="1. Yes  2. No")
 
-            await photo_handler(update, context)
+            await image_handler(update, context)
 
             mock_handle_ui.assert_awaited_once()
             mock_sm.send_to_window.assert_not_called()
