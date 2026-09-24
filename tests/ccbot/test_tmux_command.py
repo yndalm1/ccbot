@@ -1,6 +1,8 @@
 """Unit tests for build_claude_command — shell command string assembly."""
 
 import asyncio
+import os
+import subprocess
 import time
 from unittest.mock import patch
 
@@ -125,6 +127,20 @@ class TestBuildWindowShellCmd:
         # claude exits — otherwise the window would silently disappear.
         result = build_window_shell_cmd("claude", "/bin/zsh")
         assert result.rstrip().endswith("; exec /bin/zsh")
+
+    def test_claude_starts_without_inherited_entrypoint(self):
+        """An inherited "sdk-cli" would survive into the pane's interactive
+        claude (Claude Code keeps an inherited entrypoint) and the hook would
+        refuse to register it. Run the real shell string under /bin/sh, as
+        tmux does, with a stand-in claude that reports what it inherited."""
+        probe = "sh -c 'echo entry=${CLAUDE_CODE_ENTRYPOINT-unset}'"
+        result = subprocess.run(
+            ["/bin/sh", "-c", build_window_shell_cmd(probe, "true")],
+            env={**os.environ, "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"},
+            capture_output=True,
+            text=True,
+        )
+        assert result.stdout.strip() == "entry=unset"
 
     def test_preserves_env_var_prefix(self):
         # The README documents `CLAUDE_COMMAND=IS_SANDBOX=1 claude`; this

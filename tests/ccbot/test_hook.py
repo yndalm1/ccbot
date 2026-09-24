@@ -11,6 +11,14 @@ import pytest
 from ccbot.hook import _UUID_RE, _is_hook_installed, hook_main
 
 
+@pytest.fixture(autouse=True)
+def _interactive_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every hook as the pane's interactive session unless a test says
+    otherwise: pytest inherits CLAUDE_CODE_ENTRYPOINT from whatever claude
+    launched it, and "sdk-cli" would short-circuit every registration."""
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+
+
 class TestUuidRegex:
     @pytest.mark.parametrize(
         "value",
@@ -563,6 +571,39 @@ class TestHookNestedClaudeGate:
     def test_single_claude_ancestor_registers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
+        result = self._run(
+            monkeypatch, tmp_path, ps_output=self._ps_table(nested=False)
+        )
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+    @pytest.mark.parametrize("entrypoint", ["sdk-cli", "sdk-py", "sdk-ts"])
+    def test_non_interactive_claude_is_skipped(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+        entrypoint: str,
+    ) -> None:
+        """The 2026-09-24 overworld incident: `claude -p` children of the
+        pane's session stole its mapping although ps showed a single claude
+        ancestor. The entrypoint marks them regardless of process ancestry."""
+        monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", entrypoint)
+        with caplog.at_level("INFO", logger="ccbot.hook"):
+            result = self._run(
+                monkeypatch, tmp_path, ps_output=self._ps_table(nested=False)
+            )
+        assert result is None
+        assert any(
+            "non-interactive claude" in record.getMessage() for record in caplog.records
+        )
+
+    def test_unset_entrypoint_fails_open(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
         result = self._run(
             monkeypatch, tmp_path, ps_output=self._ps_table(nested=False)
         )
