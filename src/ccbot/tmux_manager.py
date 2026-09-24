@@ -106,8 +106,15 @@ def build_window_shell_cmd(claude_cmd: str, user_shell: str) -> str:
     is findable even when the bot runs under a service manager with a
     stripped-down PATH. The trailing `; exec <user_shell>` keeps a debug
     shell in the pane after claude exits, instead of the window closing.
+
+    CLAUDE_CODE_ENTRYPOINT is unset so the pane's claude computes its own
+    ("cli" for the TUI): Claude Code keeps an inherited value, and the hook
+    refuses to register a session whose entrypoint reads "sdk*".
     """
-    return f'PATH="{_FALLBACK_PATH}:$PATH" {claude_cmd}; exec {user_shell}'
+    return (
+        f"unset CLAUDE_CODE_ENTRYPOINT; "
+        f'PATH="{_FALLBACK_PATH}:$PATH" {claude_cmd}; exec {user_shell}'
+    )
 
 
 def _text_visible_in_pane(pane_text: str, sent_text: str) -> bool:
