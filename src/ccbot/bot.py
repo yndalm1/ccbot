@@ -10,8 +10,9 @@ Core responsibilities:
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
     Unbound topics trigger the directory browser to create a new session.
-  - Photo handling: photos sent by user are downloaded and forwarded
-    to Claude Code as file paths (photo_handler).
+  - Image handling: photos and image files (PNG/JPEG/GIF/WebP) sent by
+    the user are downloaded, and Claude Code is asked to open the saved
+    file (image_handler).
   - Voice handling: voice messages are transcribed via OpenAI API and
     forwarded as text (voice_handler).
   - Automatic cleanup: closing a topic kills the associated window
@@ -43,10 +44,12 @@ from aiolimiter import AsyncLimiter
 from telegram import (
     Bot,
     BotCommand,
+    Document,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
     Message,
+    PhotoSize,
     Update,
 )
 from telegram.error import RetryAfter
@@ -738,13 +741,26 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
+        "⚠ Only text, image, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
     )
 
 
-# --- Image directory for incoming photos ---
+# --- Image directory for incoming images ---
 _IMAGES_DIR = ccbot_dir() / "images"
 _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# Image formats Claude can read, by MIME type -> saved file extension. A
+# photo is always JPEG (Telegram re-encodes it); an image sent as a file
+# keeps its own format, so anything else (e.g. an iPhone's HEIC) is refused.
+_READABLE_IMAGE_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+# Telegram's Bot API only lets bots download files up to 20 MB.
+_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 
 
 async def _media_blocked_by_ui(
@@ -774,15 +790,41 @@ async def _media_blocked_by_ui(
     return True
 
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photos sent by the user: download and forward path to Claude Code."""
+async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle images sent by the user — a photo, or an image sent as a file —
+    by downloading it and asking Claude Code to open it."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         if update.message:
             await safe_reply(update.message, "You are not authorized to use this bot.")
         return
 
-    if not update.message or not update.message.photo:
+    if not update.message:
+        return
+    if update.message.photo:
+        # Highest resolution of the sizes Telegram generated.
+        image: PhotoSize | Document = update.message.photo[-1]
+        extension = "jpg"
+    elif update.message.document:
+        image = update.message.document
+        mime_type = image.mime_type or ""
+        if mime_type not in _READABLE_IMAGE_TYPES:
+            await safe_reply(
+                update.message,
+                f"⚠ Claude Code can't read {mime_type or 'this'} images "
+                "(PNG, JPEG, GIF and WebP only). Send it as a photo instead — "
+                "Telegram converts it to JPEG.",
+            )
+            return
+        extension = _READABLE_IMAGE_TYPES[mime_type]
+    else:
+        return
+    if image.file_size and image.file_size > _BOT_DOWNLOAD_LIMIT:
+        await safe_reply(
+            update.message,
+            "⚠ This image is over Telegram's 20 MB download limit for bots. "
+            "Send it as a photo instead.",
+        )
         return
 
     chat = update.message.chat
@@ -820,21 +862,20 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if await _media_blocked_by_ui(context.bot, update.message, user.id, wid, thread_id):
         return
 
-    # Download the highest-resolution photo
-    photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
-
-    # Save to ~/.ccbot/images/<timestamp>_<file_unique_id>.jpg
-    filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
+    # Save to ~/.ccbot/images/<timestamp>_<file_unique_id>.<extension>
+    tg_file = await image.get_file()
+    filename = f"{int(time.time())}_{image.file_unique_id}.{extension}"
     file_path = _IMAGES_DIR / filename
     await tg_file.download_to_drive(file_path)
 
-    # Build the message to send to Claude Code
+    # Phrase it as the user's own instruction to open this one file: the
+    # session reads a bare "(image attached: <path>)" as a description, and
+    # may stop to ask before reading a file outside its working directory.
     caption = update.message.caption or ""
     if caption:
-        text_to_send = f"{caption}\n\n(image attached: {file_path})"
+        text_to_send = f"{caption}\n\n(Open the image I sent: {file_path})"
     else:
-        text_to_send = f"(image attached: {file_path})"
+        text_to_send = f"Open and look at the image I sent: {file_path}"
 
     clear_status_msg_info(user.id, thread_id)
 
@@ -2204,8 +2245,10 @@ def create_bot() -> Application:
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )
-    # Photos: download and forward file path to Claude Code
-    application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    # Images (photos, or image files): download and ask Claude Code to open
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_handler)
+    )
     # Voice: transcribe via OpenAI and forward text to Claude Code
     application.add_handler(MessageHandler(filters.VOICE, voice_handler))
     # Catch-all: non-text content (stickers, video, etc.)
