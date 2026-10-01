@@ -299,7 +299,7 @@ class TestSendKeysVerifyBeforeEnter:
         )
         return calls
 
-    async def test_returns_false_and_does_not_send_enter_when_never_visible(
+    async def test_returns_not_visible_and_does_not_send_enter_when_never_visible(
         self, monkeypatch
     ):
         mgr = TmuxManager()
@@ -312,12 +312,12 @@ class TestSendKeysVerifyBeforeEnter:
 
         result = await mgr.send_keys("@3", "hello there")
 
-        assert result is False
+        assert result is tm.SendResult.NOT_VISIBLE
         assert not any("Enter" in call for call in calls)
         # The literal text itself was still attempted.
         assert any("-l" in call for call in calls)
 
-    async def test_returns_true_and_sends_enter_when_visible(self, monkeypatch):
+    async def test_returns_sent_and_sends_enter_when_visible(self, monkeypatch):
         mgr = TmuxManager()
         calls = self._patch_subprocess(monkeypatch)
 
@@ -328,7 +328,7 @@ class TestSendKeysVerifyBeforeEnter:
 
         result = await mgr.send_keys("@3", "hello there")
 
-        assert result is True
+        assert result is tm.SendResult.SENT
         assert any("Enter" in call for call in calls)
 
     async def test_literal_argv_uses_dash_l_and_separator(self, monkeypatch):
@@ -342,7 +342,7 @@ class TestSendKeysVerifyBeforeEnter:
 
         result = await mgr.send_keys("@3", "-not-an-option")
 
-        assert result is True
+        assert result is tm.SendResult.SENT
         literal_call = next(
             call for call in calls if "send-keys" in call and "Enter" not in call
         )
@@ -367,7 +367,7 @@ class TestSendKeysVerifyBeforeEnter:
 
         result = await mgr.send_keys("@3", "hello there")
 
-        assert result is True
+        assert result is tm.SendResult.SENT
         assert attempts["n"] == 3
         assert any("Enter" in call for call in calls)
 
@@ -384,11 +384,11 @@ class TestSendKeysVerifyBeforeEnter:
 
         result = await mgr.send_keys("@3", "hello there")
 
-        assert result is False
+        assert result is tm.SendResult.NOT_VISIBLE
         assert attempts["n"] == tm._SEND_VERIFY_ATTEMPTS
 
     async def test_nonzero_returncode_fails_without_retrying_capture(self, monkeypatch):
-        # A rejected tmux send-keys (e.g. bad target) must surface as False
+        # A rejected tmux send-keys (e.g. bad target) must surface as REJECTED
         # immediately, not proceed to poll/verify at all.
         mgr = TmuxManager()
         self._patch_subprocess(monkeypatch, returncode=1, stderr=b"can't find pane")
@@ -402,7 +402,7 @@ class TestSendKeysVerifyBeforeEnter:
 
         result = await mgr.send_keys("@999", "hello")
 
-        assert result is False
+        assert result is tm.SendResult.REJECTED
         assert capture_calls["n"] == 0
 
     async def test_special_key_path_still_used_when_enter_is_false(self, monkeypatch):
@@ -413,7 +413,7 @@ class TestSendKeysVerifyBeforeEnter:
 
         result = await mgr.send_keys("@3", "Escape", enter=False, literal=False)
 
-        assert result is False
+        assert result is tm.SendResult.REJECTED
 
     async def test_concurrent_sends_to_same_window_do_not_interleave(self, monkeypatch):
         mgr = TmuxManager()
@@ -423,7 +423,7 @@ class TestSendKeysVerifyBeforeEnter:
             order.append(f"start:{text}")
             await asyncio.sleep(0.01)
             order.append(f"end:{text}")
-            return True
+            return tm.SendResult.SENT
 
         monkeypatch.setattr(mgr, "_send_literal_with_enter", _fake_literal_with_enter)
 

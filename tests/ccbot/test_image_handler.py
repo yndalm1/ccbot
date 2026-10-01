@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ccbot.bot import image_handler
+from ccbot.tmux_manager import SendResult
 
 
 def _make_update(
@@ -50,7 +51,7 @@ def _bound_topic(tmp_path):
         patch("ccbot.bot.safe_reply", new_callable=AsyncMock) as mock_reply,
     ):
         mock_sm.get_window_for_thread.return_value = "@5"
-        mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+        mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
         mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
         mock_tmux.capture_pane = AsyncMock(return_value="$ ")
         yield mock_sm, mock_reply

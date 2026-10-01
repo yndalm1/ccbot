@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ccbot.tmux_manager import SendResult
+
 
 def _make_update(text: str, user_id: int = 1, thread_id: int = 42) -> MagicMock:
     """Build a minimal mock Update with message text in a forum topic."""
@@ -45,7 +47,7 @@ class TestForwardCommand:
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
-            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+            mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
 
             from ccbot.bot import forward_command_handler
 
@@ -69,7 +71,7 @@ class TestForwardCommand:
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
-            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+            mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
 
             from ccbot.bot import forward_command_handler
 
@@ -93,7 +95,7 @@ class TestForwardCommand:
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
-            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+            mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
 
             from ccbot.bot import forward_command_handler
 
@@ -119,7 +121,7 @@ class TestForwardCommand:
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
-            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+            mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
 
             from ccbot.bot import forward_command_handler
 
@@ -146,7 +148,7 @@ class TestForwardCommand:
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
-            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+            mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
 
             from ccbot.bot import forward_command_handler
 

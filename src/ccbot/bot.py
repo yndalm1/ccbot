@@ -86,6 +86,7 @@ from .handlers.callback_data import (
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
+    CB_SEND_FAIL_RESTART,
     CB_SCREENSHOT_REFRESH,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
@@ -142,7 +143,7 @@ from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
-from .tmux_manager import tmux_manager
+from .tmux_manager import SendResult, tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
 from .utils import ccbot_dir, supervise_loop
@@ -537,6 +538,88 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
     )
 
 
+# Per-cause notice for a send that did not go through: what ccbot observed,
+# then the action that fits that cause. NOT_VISIBLE is followed by a
+# screenshot of the pane carrying the screenshot control keys.
+_SEND_FAILURE_TEXT: dict[SendResult, str] = {
+    SendResult.WINDOW_GONE: (
+        "❌ Not delivered: this topic's tmux window no longer exists "
+        "(closed or killed).\n"
+        "→ Send any message here to start setting up a new session."
+    ),
+    SendResult.REJECTED: (
+        "❌ Not delivered: tmux rejected the keystrokes for this window.\n"
+        "→ Try again. If it keeps failing, /screenshot to see the session, "
+        "or /restart it."
+    ),
+    SendResult.NOT_VISIBLE: (
+        "⚠️ Not submitted: your message was typed but never showed up in "
+        "Claude's input box. Something is covering it (screenshot below).\n"
+        "→ A menu or dialog: answer it with the keys under the screenshot, "
+        "then resend your message.\n"
+        "→ A shell prompt (Claude has exited): tap ♻️ Restart."
+    ),
+}
+
+
+async def _report_send_failure(
+    bot: Bot,
+    chat_id: int,
+    thread_id: int | None,
+    window_id: str,
+    result: SendResult,
+) -> None:
+    """Tell the topic why a send did not go through and what to do next.
+
+    A NOT_VISIBLE notice carries a ♻️ Restart button and is followed by a
+    screenshot of the pane with the screenshot control keys, so whatever
+    covers the input box can be seen and answered from the phone.
+    """
+    logger.warning("Send to window %s did not go through: %s", window_id, result.name)
+    text = _SEND_FAILURE_TEXT[result]
+    if result is not SendResult.NOT_VISIBLE:
+        await safe_send(bot, chat_id, text, message_thread_id=thread_id)
+        return
+
+    restart_keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "♻️ Restart",
+                    callback_data=f"{CB_SEND_FAIL_RESTART}{window_id}"[:64],
+                )
+            ]
+        ]
+    )
+    await safe_send(
+        bot, chat_id, text, message_thread_id=thread_id, reply_markup=restart_keyboard
+    )
+
+    pane_text = await tmux_manager.capture_pane(window_id, with_ansi=True)
+    if not pane_text:
+        await safe_send(
+            bot,
+            chat_id,
+            "❌ Couldn't capture the session's screen — try /screenshot.",
+            message_thread_id=thread_id,
+        )
+        return
+    png_bytes = await text_to_image(pane_text, with_ansi=True)
+    thread_kwargs = {"message_thread_id": thread_id} if thread_id is not None else {}
+    try:
+        await bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(png_bytes),
+            filename="screenshot.png",
+            reply_markup=_build_screenshot_keyboard(window_id),
+            **thread_kwargs,  # type: ignore[arg-type]
+        )
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error("Failed to send send-failure screenshot: %s", e)
+
+
 async def topic_closed_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -711,8 +794,8 @@ async def forward_command_handler(
     logger.info(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
     )
-    success, message = await session_manager.send_to_window(wid, cc_slash)
-    if success:
+    result = await session_manager.send_to_window(wid, cc_slash)
+    if result is SendResult.SENT:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
@@ -725,7 +808,9 @@ async def forward_command_handler(
         # interactive UIs every 1s (status_polling.py), so no
         # proactive detection needed here — the poller handles it.
     else:
-        await safe_reply(update.message, f"❌ {message}")
+        await _report_send_failure(
+            context.bot, update.message.chat_id, thread_id, wid, result
+        )
 
 
 async def unsupported_content_handler(
@@ -879,9 +964,11 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     clear_status_msg_info(user.id, thread_id)
 
-    success, message = await session_manager.send_to_window(wid, text_to_send)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
+    result = await session_manager.send_to_window(wid, text_to_send)
+    if result is not SendResult.SENT:
+        await _report_send_failure(
+            context.bot, update.message.chat_id, thread_id, wid, result
+        )
         return
 
     # Confirm to user
@@ -958,9 +1045,11 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     clear_status_msg_info(user.id, thread_id)
 
-    success, message = await session_manager.send_to_window(wid, text)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
+    result = await session_manager.send_to_window(wid, text)
+    if result is not SendResult.SENT:
+        await _report_send_failure(
+            context.bot, update.message.chat_id, thread_id, wid, result
+        )
         return
 
     await safe_reply(update.message, f'🎤 "{text}"')
@@ -1222,9 +1311,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Small delay to let UI render in Telegram before text arrives
         await asyncio.sleep(0.3)
 
-    success, message = await session_manager.send_to_window(wid, text)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
+    result = await session_manager.send_to_window(wid, text)
+    if result is not SendResult.SENT:
+        await _report_send_failure(
+            context.bot, update.message.chat_id, thread_id, wid, result
+        )
         return
 
     # Start background capture for ! bash command output
@@ -1419,17 +1510,17 @@ async def _create_and_bind_window(
                     created_wname,
                     len(pending_text),
                 )
-                send_ok, send_msg = await session_manager.send_to_window(
+                send_result = await session_manager.send_to_window(
                     created_wid,
                     pending_text,
                 )
-                if not send_ok:
-                    logger.warning("Failed to forward pending text: %s", send_msg)
-                    await safe_send(
+                if send_result is not SendResult.SENT:
+                    await _report_send_failure(
                         context.bot,
                         resolved_chat,
-                        f"❌ Failed to send pending message: {send_msg}",
-                        message_thread_id=pending_thread_id,
+                        pending_thread_id,
+                        created_wid,
+                        send_result,
                     )
         else:
             # Should not happen in topic-only mode, but handle gracefully
@@ -1726,16 +1817,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Forward pending text if any
         if pending_text:
-            send_ok, send_msg = await session_manager.send_to_window(
+            send_result = await session_manager.send_to_window(
                 selected_wid, pending_text
             )
-            if not send_ok:
-                logger.warning("Failed to forward pending text: %s", send_msg)
-                await safe_send(
-                    context.bot,
-                    resolved_chat,
-                    f"❌ Failed to send pending message: {send_msg}",
-                    message_thread_id=thread_id,
+            if send_result is not SendResult.SENT:
+                await _report_send_failure(
+                    context.bot, resolved_chat, thread_id, selected_wid, send_result
                 )
         await query.answer("Bound")
 
@@ -1922,6 +2009,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
             except Exception:
                 pass  # Screenshot unchanged or message too old
+
+    # Not-submitted send notice: restart the session in place (same as /restart)
+    elif data.startswith(CB_SEND_FAIL_RESTART):
+        window_id = data[len(CB_SEND_FAIL_RESTART) :]
+        thread_id = cb_thread_id
+        if (
+            thread_id is None
+            or session_manager.resolve_window_for_thread(user.id, thread_id)
+            != window_id
+        ):
+            await query.answer(
+                "This topic is no longer bound to that session", show_alert=True
+            )
+            return
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await query.answer("Window not found", show_alert=True)
+            return
+
+        await query.answer("♻️ Restarting…")
+        # Drop the button so a second tap can't respawn the session again.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass  # Message too old or already edited
+        from .update_watcher import restart_topic_in_place
+
+        await restart_topic_in_place(context.bot, user.id, thread_id, w.window_id)
 
 
 # --- Streaming response / notifications ---

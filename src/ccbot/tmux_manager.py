@@ -17,8 +17,10 @@ in the text can't be mis-parsed as an option), the text is polled for in
 `capture-pane` before Enter is sent (so a slow-redrawing TUI can't turn
 Enter into a stray newline), and the whole per-window sequence runs under
 a lock (`_get_send_lock`) so concurrent sends to one window can't interleave.
+It returns a `SendResult` naming the outcome, so callers can tell a tmux
+rejection apart from text that was typed but never appeared.
 
-Key class: TmuxManager (singleton instantiated as `tmux_manager`).
+Key classes: TmuxManager (singleton instantiated as `tmux_manager`), SendResult.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import pwd
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TypeVar
 
@@ -134,6 +137,24 @@ def _text_visible_in_pane(pane_text: str, sent_text: str) -> bool:
         return True
     haystack = "".join("".join(pane_text.splitlines()[-15:]).split())
     return needle in haystack
+
+
+class SendResult(Enum):
+    """Outcome of sending input to a window — one member per distinct cause.
+
+    SENT: delivered (for a text send: seen in the pane, then Enter sent).
+    WINDOW_GONE: the target window no longer exists (detected by
+        `SessionManager.send_to_window` before any keys are sent).
+    REJECTED: tmux refused the send or could not be run.
+    NOT_VISIBLE: the text was typed but never appeared in the pane, so Enter
+        was withheld — something other than Claude's input box holds the
+        pane (a dialog, a menu, an exited session's shell).
+    """
+
+    SENT = "sent"
+    WINDOW_GONE = "window_gone"
+    REJECTED = "rejected"
+    NOT_VISIBLE = "not_visible"
 
 
 @dataclass
@@ -528,7 +549,7 @@ class TmuxManager:
 
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
-    ) -> bool:
+    ) -> SendResult:
         """Send keys to a specific window.
 
         Runs the whole sequence (literal text + verify + Enter, or a
@@ -544,14 +565,16 @@ class TmuxManager:
                      like "Up", "Down", "Left", "Right", "Escape", "Enter".
 
         Returns:
-            True if successful, False otherwise
+            SENT on success; NOT_VISIBLE when literal text never appeared in
+            the pane (Enter withheld); REJECTED for any other failure.
         """
         async with self._get_send_lock(window_id):
             if literal and enter:
                 return await self._send_literal_with_enter(window_id, text)
-            return await self._send_special_or_no_enter(window_id, text, enter, literal)
+            sent = await self._send_special_or_no_enter(window_id, text, enter, literal)
+            return SendResult.SENT if sent else SendResult.REJECTED
 
-    async def _send_literal_with_enter(self, window_id: str, text: str) -> bool:
+    async def _send_literal_with_enter(self, window_id: str, text: str) -> SendResult:
         """Send literal text, verify it actually landed, then send Enter.
 
         Claude Code's TUI sometimes interprets a rapid-fire Enter (arriving
@@ -565,28 +588,31 @@ class TmuxManager:
         # semantics as before, just via the raw/verified send.
         if text.startswith("!"):
             if not await self._send_literal_raw(window_id, "!"):
-                return False
+                return SendResult.REJECTED
             rest = text[1:]
             sent_text = "!"
             if rest:
                 await asyncio.sleep(1.0)
                 if not await self._send_literal_raw(window_id, rest):
-                    return False
+                    return SendResult.REJECTED
                 sent_text = rest
         else:
             if not await self._send_literal_raw(window_id, text):
-                return False
+                return SendResult.REJECTED
             sent_text = text
 
         return await self._verify_and_send_enter(window_id, sent_text)
 
-    async def _verify_and_send_enter(self, window_id: str, sent_text: str) -> bool:
+    async def _verify_and_send_enter(
+        self, window_id: str, sent_text: str
+    ) -> SendResult:
         """Poll capture-pane until `sent_text` is visible, then send Enter.
 
-        Returns False without sending Enter if the text never becomes
-        visible — a silent half-typed submit is worse than the honest
-        '❌ Failed to send keys' the caller (session.send_to_window)
-        already surfaces to the user.
+        Returns NOT_VISIBLE without sending Enter if the text never becomes
+        visible — a silent half-typed submit is worse than telling the user
+        their message was not submitted. Text that never shows up means
+        something other than the input box holds the pane, so the caller
+        reports this cause with the pane attached.
         """
         visible = False
         for attempt in range(_SEND_VERIFY_ATTEMPTS):
@@ -605,9 +631,11 @@ class TmuxManager:
                 _SEND_VERIFY_ATTEMPTS,
                 sent_text[:40],
             )
-            return False
+            return SendResult.NOT_VISIBLE
 
-        return await self._send_enter_raw(window_id)
+        if not await self._send_enter_raw(window_id):
+            return SendResult.REJECTED
+        return SendResult.SENT
 
     async def _send_literal_raw(self, window_id: str, chars: str) -> bool:
         """Send literal text via a raw `tmux send-keys -l --` subprocess.
