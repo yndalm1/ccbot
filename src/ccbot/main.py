@@ -4,10 +4,46 @@ Handles two execution modes:
   1. `ccbot hook` — delegates to hook.hook_main() for Claude Code hook processing.
   2. Default — configures logging, initializes tmux session, and starts the
      Telegram bot polling loop via bot.create_bot().
+
+Logs go to a size-capped rotating file, `ccbot.log` in the config directory
+(see `configure_logging`), so a long-running service can't fill the disk.
 """
 
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+LOG_FILE_NAME = "ccbot.log"
+# The live file rotates at LOG_MAX_BYTES and LOG_BACKUP_COUNT rotated files are
+# kept, so the logs never use more than 100 MB of disk in total.
+LOG_MAX_BYTES = 50 * 1024 * 1024
+LOG_BACKUP_COUNT = 1
+_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+
+def configure_logging(log_dir: Path) -> None:
+    """Send all logging to the rotating `ccbot.log` in `log_dir`.
+
+    The rotating file is the single log destination. Logging is echoed to
+    stderr only when stderr is a terminal (an interactive run); under a
+    service manager stderr is a file or the journal and is left to output
+    from before logging starts, such as a startup crash.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(
+            log_dir / LOG_FILE_NAME,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    ]
+    if sys.stderr.isatty():
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(
+        format=_LOG_FORMAT, level=logging.WARNING, handlers=handlers, force=True
+    )
 
 
 def main() -> None:
@@ -18,17 +54,14 @@ def main() -> None:
         hook_main()
         return
 
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.WARNING,
-    )
+    from .utils import ccbot_dir
+
+    configure_logging(ccbot_dir())
 
     # Import config before enabling DEBUG — avoid leaking debug logs on config errors
     try:
         from .config import config
     except ValueError as e:
-        from .utils import ccbot_dir
-
         config_dir = ccbot_dir()
         env_path = config_dir / ".env"
         print(f"Error: {e}\n")

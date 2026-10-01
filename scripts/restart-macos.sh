@@ -26,10 +26,11 @@ sleep 2
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     echo "ccbot restarted successfully."
     echo "----------------------------------------"
-    tail -n 20 "$HOME/.ccbot/ccbot.stdout.log" 2>/dev/null || true
-    tail -n 20 "$HOME/.ccbot/ccbot.stderr.log" 2>/dev/null || true
+    tail -n 20 "${CCBOT_DIR:-$HOME/.ccbot}/ccbot.log" 2>/dev/null || true
     echo "----------------------------------------"
 else
-    echo "Error: ccbot failed to start."
+    # A crash before logging starts lands in launchd's stderr file, not ccbot.log.
+    echo "Error: ccbot failed to start. Startup output:"
+    tail -n 30 "$HOME/.ccbot/ccbot.stderr.log" 2>/dev/null || true
     exit 1
 fi

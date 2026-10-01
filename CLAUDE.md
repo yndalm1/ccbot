@@ -36,6 +36,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - Config directory: `~/.ccbot/` by default, override with `CCBOT_DIR` env var.
 - `.env` loading priority: local `.env` > config dir `.env`.
 - State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets).
+- Log file: `ccbot.log` in the config dir — rotates at 50 MB with one backup (`ccbot.log.1`), so logs never exceed 100 MB. The service's own stdout/stderr (launchd `ccbot.std*.log`, systemd journal) only hold output from before logging starts, such as a startup crash.
 - Service management is platform-specific: Linux uses `systemd`; macOS uses `launchd`.
 - For Linux, use `deploy/linux/ccbot.service` as the unit template; for macOS, keep a local agent plist in `~/Library/LaunchAgents/` and use `deploy/macos/com.ccbot.plist` as the template.
 - **Dedicated tmux socket:** ccbot runs its tmux server on a dedicated socket (`TMUX_SOCKET_NAME`, default `ccbot`) so it is isolated from the user's interactive tmux — foreign sessions can't leak into `session_map`, and the service can restart without killing sessions (unit uses `KillMode=process`; launchd uses `AbandonProcessGroup`). Attach over SSH with `tmux -L ccbot attach -t ccbot` (handy alias: `alias ctmux='tmux -L ccbot'`). On restart, ccbot reattaches to the existing server and resumes monitoring. The systemd unit is a user unit (`WantedBy=default.target`): run `loginctl enable-linger <user>`, or the service (and this survival story) stops at logout.
