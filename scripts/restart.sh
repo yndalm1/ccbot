@@ -23,7 +23,7 @@ sleep 2
 if systemctl --user is-active --quiet ccbot; then
     echo "ccbot restarted successfully. Recent logs:"
     echo "----------------------------------------"
-    journalctl --user -u ccbot --since "5 sec ago" --no-pager | tail -20
+    tail -n 20 "${CCBOT_DIR:-$HOME/.ccbot}/ccbot.log" 2>/dev/null || true
     echo "----------------------------------------"
 else
     echo "Warning: ccbot service failed to start. Logs:"
