@@ -34,7 +34,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .tmux_manager import tmux_manager
+from .tmux_manager import SendResult, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
@@ -1102,8 +1102,8 @@ class SessionManager:
 
     # --- Tmux helpers ---
 
-    async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
-        """Send text to a tmux window by ID."""
+    async def send_to_window(self, window_id: str, text: str) -> SendResult:
+        """Send text to a tmux window by ID; the result names the outcome."""
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",
@@ -1113,11 +1113,8 @@ class SessionManager:
         )
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
-            return False, "Window not found (may have been closed)"
-        success = await tmux_manager.send_keys(window.window_id, text)
-        if success:
-            return True, f"Sent to {display}"
-        return False, "Failed to send keys"
+            return SendResult.WINDOW_GONE
+        return await tmux_manager.send_keys(window.window_id, text)
 
     # --- Message history ---
 

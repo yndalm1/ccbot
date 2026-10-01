@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ccbot.bot import _media_blocked_by_ui, image_handler, voice_handler
+from ccbot.tmux_manager import SendResult
 
 
 class TestMediaBlockedByUiHelper:
@@ -132,7 +133,7 @@ class TestPhotoHandlerBlockedByUi:
             patch("ccbot.bot.safe_reply", new_callable=AsyncMock) as mock_reply,
         ):
             mock_sm.get_window_for_thread.return_value = "@5"
-            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+            mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
             mock_tmux.capture_pane = AsyncMock(return_value="1. Yes  2. No")
 
@@ -168,7 +169,7 @@ class TestVoiceHandlerBlockedByUi:
         ):
             mock_config.openai_api_key = "sk-test"
             mock_sm.get_window_for_thread.return_value = "@5"
-            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+            mock_sm.send_to_window = AsyncMock(return_value=SendResult.SENT)
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
             mock_tmux.capture_pane = AsyncMock(return_value="1. Yes  2. No")
 

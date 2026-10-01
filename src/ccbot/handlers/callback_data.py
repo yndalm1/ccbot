@@ -10,6 +10,7 @@ Constants:
   - CB_SCREENSHOT_*: Screenshot refresh
   - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
   - CB_KEYS_PREFIX: Screenshot control keys (kb:<key_id>:<window>)
+  - CB_SEND_FAIL_RESTART: Restart button on a not-submitted send notice
 """
 
 # History pagination
@@ -49,6 +50,9 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Not-submitted send notice: restart the session in place
+CB_SEND_FAIL_RESTART = "sf:rst:"  # sf:rst:<window>
 
 # Stale-tracking divergence notice: re-point a window's session_map entry
 CB_REPOINT = "rp:"  # rp:<window>:<session_id>
