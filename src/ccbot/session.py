@@ -255,10 +255,12 @@ class SessionManager:
                 self.group_chat_ids = {}
                 pass
 
-    async def resolve_stale_ids(self) -> None:
+    async def resolve_stale_ids(self, restore: bool = False) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
 
-        Called on startup. Handles two cases:
+        Called on startup. With ``restore`` (ccbot created the tmux session
+        itself, so the server died — typically a reboot), first recreates every
+        persisted Claude window via _restore_windows. Then handles two cases:
         1. Old-format migration: window_name keys → window_id keys
         2. Stale IDs: window_id no longer exists but display name matches a live window
 
@@ -269,6 +271,9 @@ class SessionManager:
         window renames are never checked for uniqueness), so ambiguous names
         are dropped exactly like a no-match, never guessed.
         """
+        if restore:
+            await self._restore_windows()
+
         windows = await tmux_manager.list_windows()
         live_by_name: dict[str, list[str]] = {}  # window_name -> [window_id, ...]
         live_ids: set[str] = set()
@@ -418,6 +423,109 @@ class SessionManager:
         # Clean up session_map.json: stale window IDs and old-format keys
         await self.sweep_stale_session_map_entries()
         await self._cleanup_old_format_session_map_keys()
+
+    async def _restore_windows(self) -> None:
+        """Recreate every persisted Claude window after the tmux server died.
+
+        Every persisted window ID belongs to the dead server. Each window_state
+        with a session_id (except the main placeholder) gets a new window at
+        its cwd running ``claude --resume``, and window_states, thread_bindings,
+        user_window_offsets and window_display_names move to the new IDs by
+        exact old->new mapping — never by name, which is ambiguous for windows
+        sharing a name. Anything keyed by a dead ID with no new window is
+        dropped: a fresh server reuses low IDs, so keeping it could cross-wire
+        it onto an unrelated restored window. A turn that was mid-flight comes
+        back idle; the conversation itself is in the transcript.
+        """
+
+        # The dead server's window-id keys must go before any restored
+        # window's SessionStart hook writes, so a reused ID can't surface a
+        # dead window's session.
+        def drop_window_keys(session_map: dict[str, Any]) -> bool:
+            dead_keys = [
+                key
+                for key in session_map
+                for parts in [self._split_session_map_key(key)]
+                if parts is not None and self._is_window_id(parts[1])
+            ]
+            for key in dead_keys:
+                del session_map[key]
+            return bool(dead_keys)
+
+        await asyncio.to_thread(self._locked_session_map_update, drop_window_keys)
+
+        remap: dict[str, str] = {}
+        restored: dict[str, WindowState] = {}
+        # new window id -> (resumed session_id, cwd, window name)
+        resumed: dict[str, tuple[str, str, str]] = {}
+        # Oldest window first, so restored windows keep their original order.
+        dead = sorted(
+            (k for k in self.window_states if self._is_window_id(k)),
+            key=lambda k: int(k[1:]),
+        )
+        for old_id in dead:
+            ws = self.window_states[old_id]
+            name = self.window_display_names.get(old_id, ws.window_name)
+            if not ws.session_id or name == config.tmux_main_window_name:
+                continue
+            ok, message, new_name, new_id = await tmux_manager.create_window(
+                ws.cwd, window_name=name or None, resume_session_id=ws.session_id
+            )
+            if not ok:
+                logger.warning(
+                    "Restore skipped for window %s (session %s): %s",
+                    old_id,
+                    ws.session_id,
+                    message,
+                )
+                continue
+            logger.info(
+                "Restored window %s -> %s (%s, session %s)",
+                old_id,
+                new_id,
+                new_name,
+                ws.session_id,
+            )
+            remap[old_id] = new_id
+            resumed[new_id] = (ws.session_id, ws.cwd, new_name)
+            ws.window_name = new_name
+            # Pin over "" until the hook reports, so a load_session_map run
+            # in between doesn't drop this not-yet-hooked window.
+            ws.pinned_over = ""
+            restored[new_id] = ws
+
+        self.window_states = restored
+        self.window_display_names = {
+            new_id: ws.window_name for new_id, ws in restored.items()
+        }
+        for uid, bindings in self.thread_bindings.items():
+            self.thread_bindings[uid] = {
+                tid: remap[wid] for tid, wid in bindings.items() if wid in remap
+            }
+        for uid, offsets in self.user_window_offsets.items():
+            self.user_window_offsets[uid] = {
+                remap[wid]: off for wid, off in offsets.items() if wid in remap
+            }
+        self._save_state()
+
+        if not resumed:
+            return
+
+        # Same as a picker resume: wait for each SessionStart hook (resume
+        # sessions start slowly, hence 15s), then pin the resumed session.
+        hook_oks = await asyncio.gather(
+            *(
+                self.wait_for_session_map_entry(new_id, timeout=15.0)
+                for new_id in resumed
+            )
+        )
+        from .update_watcher import current_claude_version
+
+        launch_version = await current_claude_version()
+        for (new_id, (sid, cwd, name)), hook_ok in zip(resumed.items(), hook_oks):
+            self.pin_resumed_session(new_id, sid, cwd, name, hook_ok)
+            if launch_version:
+                self.set_claude_launch_version(new_id, launch_version)
 
     async def _accepted_session_map_names(self) -> set[str]:
         """Return the configured tmux session plus any grouped peers."""
@@ -799,6 +907,51 @@ class SessionManager:
         state.pinned_over = None
         self._save_state()
         logger.info("Cleared session for window_id %s", window_id)
+
+    def pin_resumed_session(
+        self,
+        window_id: str,
+        resume_session_id: str,
+        cwd: str,
+        window_name: str,
+        hook_ok: bool,
+    ) -> None:
+        """Point a `--resume` window's state at the session it resumed.
+
+        --resume creates a new session_id in the hook, but messages continue
+        writing to the resumed session's JSONL file. Override window_state to
+        track the original session_id so the monitor can route messages back.
+        """
+        ws = self.get_window_state(window_id)
+        if not hook_ok:
+            # Hook timed out — manually populate window_state so the
+            # monitor can still route messages back to this topic. Pin
+            # over "" so ANY future hook entry with a non-empty, different
+            # session_id unpins (the hook-sync loop must not revert this).
+            logger.warning(
+                "Hook timed out for resume window %s, "
+                "manually setting session_id=%s cwd=%s",
+                window_id,
+                resume_session_id,
+                cwd,
+            )
+            ws.session_id = resume_session_id
+            ws.cwd = cwd
+            ws.window_name = window_name
+            ws.pinned_over = ""
+            self._save_state()
+        elif ws.session_id != resume_session_id:
+            logger.info(
+                "Resume override: window %s session_id %s -> %s",
+                window_id,
+                ws.session_id,
+                resume_session_id,
+            )
+            # Pin over the hook-reported sid being outranked so the
+            # hook-sync loop doesn't revert this override on its next poll.
+            ws.pinned_over = ws.session_id
+            ws.session_id = resume_session_id
+            self._save_state()
 
     def set_claude_launch_version(self, window_id: str, version: str) -> None:
         """Record the installed claude version active when this window launched.

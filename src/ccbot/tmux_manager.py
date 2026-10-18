@@ -184,6 +184,11 @@ class TmuxManager:
         # interactive-UI button press) can't interleave their keystrokes and
         # Enter presses (RC11 / f37).
         self._send_locks: dict[str, asyncio.Lock] = {}
+        # True once get_or_create_session has created the session itself
+        # instead of finding it running. Read at startup: a session ccbot had
+        # to create means the tmux server died (typically a reboot), so every
+        # persisted window ID is dead and its windows need restoring.
+        self.created_session = False
 
     @property
     def server(self) -> libtmux.Server:
@@ -257,6 +262,7 @@ class TmuxManager:
             session_name=self.session_name,
             start_directory=str(Path.home()),
         )
+        self.created_session = True
         # Rename the default window to the main window name
         if session.windows:
             session.windows[0].rename_window(config.tmux_main_window_name)
