@@ -752,15 +752,20 @@ class TestResolveStaleIdsAmbiguousNames:
 
 
 class TestResolveStaleIdsRestore:
-    """resolve_stale_ids(restore=True) runs when ccbot created the tmux session
-    itself — the server died (typically a reboot). Every persisted Claude
-    window comes back running `claude --resume`, and its topic binding moves to
-    the new window ID by exact mapping, never by (ambiguous) name."""
+    """resolve_stale_ids(server=...) restores when the live tmux server is not
+    the one that issued the persisted window IDs (typically after a reboot).
+    Every persisted Claude window comes back running `claude --resume`, and
+    its topic binding moves to the new window ID by exact mapping, never by
+    (ambiguous) name."""
+
+    OLD, NEW = "100:1700000000", "200:1800000000"
 
     @staticmethod
-    def _mock_tmux(monkeypatch) -> tuple[list, AsyncMock]:
+    def _mock_tmux(monkeypatch, hook=None) -> tuple[list, AsyncMock]:
         """Fake a fresh tmux server: create_window hands out @1, @2, ... and
-        de-duplicates names the way TmuxManager.create_window does."""
+        de-duplicates names the way TmuxManager.create_window does. ``hook``
+        (window_id, resume_session_id) runs per created window, standing in
+        for Claude's SessionStart hook."""
         from ccbot.tmux_manager import TmuxWindow
 
         live: list[TmuxWindow] = []
@@ -772,6 +777,8 @@ class TestResolveStaleIdsRestore:
                 name, n = f"{base}-{n}", n + 1
             wid = f"@{len(live) + 1}"
             live.append(TmuxWindow(window_id=wid, window_name=name, cwd=work_dir))
+            if hook:
+                hook(wid, resume_session_id)
             return True, "ok", name, wid
 
         create = AsyncMock(side_effect=create_window)
@@ -795,7 +802,13 @@ class TestResolveStaleIdsRestore:
         return live, create
 
     @staticmethod
-    def _persist(mgr: SessionManager, wid: str, name: str, sid: str) -> None:
+    def _no_hook(monkeypatch, mgr: SessionManager) -> None:
+        monkeypatch.setattr(
+            mgr, "wait_for_session_map_entry", AsyncMock(return_value=False)
+        )
+
+    def _persist(self, mgr: SessionManager, wid: str, name: str, sid: str) -> None:
+        mgr.tmux_server = self.OLD
         ws = mgr.get_window_state(wid)
         ws.session_id = sid
         ws.cwd = "/proj"
@@ -808,15 +821,13 @@ class TestResolveStaleIdsRestore:
     ) -> None:
         _, create = self._mock_tmux(monkeypatch)
         monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
-        monkeypatch.setattr(
-            mgr, "wait_for_session_map_entry", AsyncMock(return_value=False)
-        )
+        self._no_hook(monkeypatch, mgr)
         self._persist(mgr, "@119", "claude", "sid-a")
         self._persist(mgr, "@135", "claude", "sid-b")
         mgr.thread_bindings[100] = {5: "@135", 6: "@119"}
         mgr.user_window_offsets[100] = {"@135": 42}
 
-        await mgr.resolve_stale_ids(restore=True)
+        await mgr.resolve_stale_ids(server=self.NEW)
 
         resumes = [c.kwargs["resume_session_id"] for c in create.await_args_list]
         assert resumes == ["sid-a", "sid-b"]
@@ -829,24 +840,49 @@ class TestResolveStaleIdsRestore:
         assert mgr.user_window_offsets[100] == {"@2": 42}
         assert mgr.window_display_names == {"@1": "claude", "@2": "claude-2"}
         assert mgr.window_states["@1"].claude_launch_version == "2.0.0"
+        assert mgr.tmux_server == self.NEW
 
     @pytest.mark.asyncio
-    async def test_skips_main_window_and_sessionless_window(
+    async def test_skips_main_sessionless_and_cwdless_windows(
         self, mgr: SessionManager, monkeypatch, tmp_path
     ) -> None:
         _, create = self._mock_tmux(monkeypatch)
         monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
-        monkeypatch.setattr(
-            mgr, "wait_for_session_map_entry", AsyncMock(return_value=False)
-        )
+        self._no_hook(monkeypatch, mgr)
         self._persist(mgr, "@105", config.tmux_main_window_name, "sid-main")
         self._persist(mgr, "@7", "shell", "")
+        self._persist(mgr, "@8", "nowhere", "sid-x")
+        mgr.window_states["@8"].cwd = ""
         self._persist(mgr, "@119", "claude", "sid-a")
 
-        await mgr.resolve_stale_ids(restore=True)
+        await mgr.resolve_stale_ids(server=self.NEW)
 
         assert create.await_count == 1
         assert set(mgr.window_states) == {"@1"}
+
+    @pytest.mark.asyncio
+    async def test_failed_create_drops_that_binding(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        _, create = self._mock_tmux(monkeypatch)
+        real = create.side_effect
+
+        async def fail_for_gone(work_dir, window_name=None, resume_session_id=None):
+            if resume_session_id == "sid-gone":
+                return False, "Directory does not exist", "", ""
+            return await real(work_dir, window_name, resume_session_id)
+
+        create.side_effect = fail_for_gone
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        self._no_hook(monkeypatch, mgr)
+        self._persist(mgr, "@3", "gone", "sid-gone")
+        self._persist(mgr, "@4", "claude", "sid-a")
+        mgr.thread_bindings[100] = {5: "@3", 6: "@4"}
+
+        await mgr.resolve_stale_ids(server=self.NEW)
+
+        assert mgr.get_window_for_thread(100, 5) is None
+        assert mgr.get_window_for_thread(100, 6) == "@1"
 
     @pytest.mark.asyncio
     async def test_dead_binding_never_lands_on_reused_low_id(
@@ -857,77 +893,215 @@ class TestResolveStaleIdsRestore:
         @1 — that would cross-wire the topic onto another session."""
         self._mock_tmux(monkeypatch)
         monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
-        monkeypatch.setattr(
-            mgr, "wait_for_session_map_entry", AsyncMock(return_value=False)
-        )
+        self._no_hook(monkeypatch, mgr)
         self._persist(mgr, "@119", "claude", "sid-a")
         mgr.thread_bindings[100] = {5: "@1", 6: "@119"}
         mgr.window_display_names["@1"] = "gone"
 
-        await mgr.resolve_stale_ids(restore=True)
+        await mgr.resolve_stale_ids(server=self.NEW)
 
         assert mgr.get_window_for_thread(100, 5) is None
         assert mgr.get_window_for_thread(100, 6) == "@1"
 
     @pytest.mark.asyncio
-    async def test_drops_dead_server_session_map_keys(
+    async def test_real_hook_reconciliation(
         self, mgr: SessionManager, monkeypatch, tmp_path
     ) -> None:
-        self._mock_tmux(monkeypatch)
+        """Drives the real wait_for_session_map_entry / load_session_map
+        against session_map.json with a simulated hook:
+        - @1's hook reports the resumed sid itself -> plain, unpinned;
+        - @2's hook reports a different sid -> stays on the resumed one, pinned
+          over the hook's;
+        - @3's hook never fires -> must survive the stale-entry cleanup that
+          @1's and @2's hook arrivals trigger, and must NOT read the dead
+          server's "ccbot:@3" entry (cleared before any window is created)."""
         session_map_file = tmp_path / "session_map.json"
         session_map_file.write_text(
-            json.dumps({"ccbot:@1": {"session_id": "dead-sid", "cwd": "/old"}}),
+            json.dumps({"ccbot:@3": {"session_id": "dead-sid", "cwd": "/old"}}),
             encoding="utf-8",
         )
         monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        hook_sids = {"sid-a": "sid-a", "sid-b": "hook-sid"}
+
+        def hook(wid: str, resume_sid: str) -> None:
+            if resume_sid not in hook_sids:
+                return
+            data = json.loads(session_map_file.read_text())
+            data[f"ccbot:{wid}"] = {
+                "session_id": hook_sids[resume_sid],
+                "cwd": "/proj",
+                "window_name": "claude",
+            }
+            session_map_file.write_text(json.dumps(data), encoding="utf-8")
+
+        self._mock_tmux(monkeypatch, hook=hook)
         monkeypatch.setattr(
-            mgr, "wait_for_session_map_entry", AsyncMock(return_value=False)
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot"}),
         )
-        self._persist(mgr, "@119", "claude", "sid-a")
+        real_wait = mgr.wait_for_session_map_entry
 
-        await mgr.resolve_stale_ids(restore=True)
+        async def short_wait(window_id, timeout=5.0):
+            return await real_wait(window_id, timeout=0.3, interval=0.05)
 
-        assert json.loads(session_map_file.read_text()) == {}
-        assert mgr.window_states["@1"].session_id == "sid-a"
+        monkeypatch.setattr(mgr, "wait_for_session_map_entry", short_wait)
+        self._persist(mgr, "@50", "claude", "sid-a")
+        self._persist(mgr, "@51", "claude", "sid-b")
+        self._persist(mgr, "@52", "claude", "sid-c")
+        mgr.window_states["@52"].update_notified_version = "1.9"
 
-    @pytest.mark.asyncio
-    async def test_pins_resumed_session_over_hook_reported_sid(
-        self, mgr: SessionManager, monkeypatch, tmp_path
-    ) -> None:
-        """Same contract as a picker resume: the hook may report a new sid for
-        a --resume window; the window stays on the resumed session, pinned."""
-        self._mock_tmux(monkeypatch)
-        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        await mgr.resolve_stale_ids(server=self.NEW)
 
-        async def hook_reports_new_sid(window_id, timeout=5.0):
-            ws = mgr.window_states[window_id]
-            ws.session_id, ws.pinned_over = "hook-sid", None
-            return True
-
-        monkeypatch.setattr(mgr, "wait_for_session_map_entry", hook_reports_new_sid)
-        self._persist(mgr, "@119", "claude", "sid-a")
-
-        await mgr.resolve_stale_ids(restore=True)
-
-        ws = mgr.window_states["@1"]
-        assert (ws.session_id, ws.pinned_over) == ("sid-a", "hook-sid")
+        states = {
+            wid: (ws.session_id, ws.pinned_over)
+            for wid, ws in mgr.window_states.items()
+        }
+        assert states == {
+            "@1": ("sid-a", None),
+            "@2": ("sid-b", "hook-sid"),
+            "@3": ("sid-c", ""),
+        }
+        # The pin kept @3's state object alive through the cleanup, so fields
+        # the hook never re-supplies survive the restore.
+        assert mgr.window_states["@3"].update_notified_version == "1.9"
 
     @pytest.mark.asyncio
-    async def test_without_restore_creates_nothing(
+    async def test_same_server_never_restores(
         self, mgr: SessionManager, monkeypatch, tmp_path
     ) -> None:
-        """A live server with a missing window means the user closed it:
+        """Same server with a missing window means the user closed it:
         keep dropping, never resurrect."""
         _, create = self._mock_tmux(monkeypatch)
         monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
         self._persist(mgr, "@119", "claude", "sid-a")
         mgr.thread_bindings[100] = {5: "@119"}
 
-        await mgr.resolve_stale_ids()
+        await mgr.resolve_stale_ids(server=self.OLD)
 
         create.assert_not_awaited()
         assert mgr.window_states == {}
         assert mgr.get_window_for_thread(100, 5) is None
+
+    @pytest.mark.asyncio
+    async def test_no_persisted_server_stamps_without_restoring(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        _, create = self._mock_tmux(monkeypatch)
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        self._persist(mgr, "@119", "claude", "sid-a")
+        mgr.tmux_server = ""
+
+        await mgr.resolve_stale_ids(server=self.NEW)
+
+        create.assert_not_awaited()
+        assert mgr.tmux_server == self.NEW
+
+    @pytest.mark.asyncio
+    async def test_unknown_live_server_neither_restores_nor_stamps(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        _, create = self._mock_tmux(monkeypatch)
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        self._persist(mgr, "@119", "claude", "sid-a")
+
+        await mgr.resolve_stale_ids(server=None)
+
+        create.assert_not_awaited()
+        assert mgr.tmux_server == self.OLD
+
+    @pytest.mark.asyncio
+    async def test_crash_mid_restore_restores_again_next_start(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """The new identity is saved only together with the remap: a crash
+        before that leaves the old identity, so the next start restores again
+        rather than name-matching the dead IDs against reused ones."""
+        _, create = self._mock_tmux(monkeypatch)
+        real = create.side_effect
+        calls = {"n": 0}
+
+        async def crash_on_second(work_dir, window_name=None, resume_session_id=None):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("killed mid-restore")
+            return await real(work_dir, window_name, resume_session_id)
+
+        create.side_effect = crash_on_second
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        self._no_hook(monkeypatch, mgr)
+        self._persist(mgr, "@2", "api", "sid-api")
+        self._persist(mgr, "@5", "web", "sid-web")
+        mgr.thread_bindings[100] = {5: "@2", 6: "@5"}
+
+        with pytest.raises(RuntimeError):
+            await mgr.resolve_stale_ids(server=self.NEW)
+        assert mgr.tmux_server == self.OLD
+        assert mgr.thread_bindings[100] == {5: "@2", 6: "@5"}
+
+        await mgr.resolve_stale_ids(server=self.NEW)
+
+        api = mgr.get_window_for_thread(100, 5)
+        web = mgr.get_window_for_thread(100, 6)
+        assert mgr.window_states[api].session_id == "sid-api"
+        assert mgr.window_states[web].session_id == "sid-web"
+        assert mgr.tmux_server == self.NEW
+
+
+class TestSweepDeadWindowStates:
+    """window_states must track the windows alive on the server that issued
+    their IDs, so a restore brings back exactly those."""
+
+    @staticmethod
+    def _mock_server(monkeypatch, live_ids, server) -> None:
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_all_window_ids",
+            AsyncMock(return_value=live_ids),
+        )
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.server_identity",
+            AsyncMock(return_value=server),
+        )
+
+    @pytest.mark.asyncio
+    async def test_prunes_dead_including_pinned(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        self._mock_server(monkeypatch, {"@1"}, "s1")
+        mgr.tmux_server = "s1"
+        mgr.get_window_state("@1").session_id = "live"
+        dead = mgr.get_window_state("@2")
+        dead.session_id, dead.pinned_over = "killed", ""
+
+        await mgr.sweep_dead_window_states()
+
+        assert set(mgr.window_states) == {"@1"}
+
+    @pytest.mark.asyncio
+    async def test_unreachable_server_keeps_everything(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        self._mock_server(monkeypatch, None, None)
+        mgr.tmux_server = "s1"
+        mgr.get_window_state("@2").session_id = "sid"
+
+        await mgr.sweep_dead_window_states()
+
+        assert set(mgr.window_states) == {"@2"}
+
+    @pytest.mark.asyncio
+    async def test_different_server_keeps_everything(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """A server that replaced the persisted one (it died while ccbot ran)
+        says nothing about the persisted IDs — they are the restore set."""
+        self._mock_server(monkeypatch, {"@1"}, "s2")
+        mgr.tmux_server = "s1"
+        mgr.get_window_state("@2").session_id = "sid"
+
+        await mgr.sweep_dead_window_states()
+
+        assert set(mgr.window_states) == {"@2"}
 
 
 class TestPinnedOverSessionRouting:

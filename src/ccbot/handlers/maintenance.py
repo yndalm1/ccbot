@@ -7,6 +7,9 @@ stalls on timeouts; maintenance is local I/O and must not queue behind it.
 
 Steps (each independently guarded, one failure never blocks the others):
   - session_map sweep: drop entries whose tmux window no longer exists.
+  - window_state sweep: drop window states whose tmux window no longer
+    exists, so a restore after the tmux server dies brings back only the
+    windows that were alive.
   - hook-failure notices: tail <CCBOT_DIR>/hook_failures.jsonl (written by
     the SessionStart hook when it cannot map a session to a window) and
     surface each failure in the topic(s) bound to that cwd.
@@ -74,6 +77,10 @@ def _hook_failures_file() -> Path:
 
 async def _sweep_session_map() -> None:
     await session_manager.sweep_stale_session_map_entries()
+
+
+async def _sweep_window_states() -> None:
+    await session_manager.sweep_dead_window_states()
 
 
 # --- step 2: hook-failure notices ----------------------------------------
@@ -348,6 +355,10 @@ async def run_maintenance_once(bot: Bot) -> None:
         await _sweep_session_map()
     except Exception as e:
         logger.error("session_map sweep failed: %s", e)
+    try:
+        await _sweep_window_states()
+    except Exception as e:
+        logger.error("window_state sweep failed: %s", e)
     try:
         await _check_hook_failures(bot)
     except Exception as e:

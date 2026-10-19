@@ -163,6 +163,9 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # Identity ("<pid>:<start_time>") of the tmux server that issued the
+    # window IDs above. Window IDs mean nothing on any other server.
+    tmux_server: str = ""
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -179,6 +182,7 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "tmux_server": self.tmux_server,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -223,6 +227,7 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.tmux_server = state.get("tmux_server", "")
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -255,12 +260,14 @@ class SessionManager:
                 self.group_chat_ids = {}
                 pass
 
-    async def resolve_stale_ids(self, restore: bool = False) -> None:
+    async def resolve_stale_ids(self, server: str | None = None) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
 
-        Called on startup. With ``restore`` (ccbot created the tmux session
-        itself, so the server died — typically a reboot), first recreates every
-        persisted Claude window via _restore_windows. Then handles two cases:
+        Called on startup with the live tmux server's identity. If it differs
+        from the persisted one, the server that issued every persisted window
+        ID is gone (typically a reboot), so _restore_windows first recreates
+        the persisted Claude windows. No persisted identity (first run) or an
+        unknown live one never restores. Then handles two cases:
         1. Old-format migration: window_name keys → window_id keys
         2. Stale IDs: window_id no longer exists but display name matches a live window
 
@@ -271,8 +278,13 @@ class SessionManager:
         window renames are never checked for uniqueness), so ambiguous names
         are dropped exactly like a no-match, never guessed.
         """
-        if restore:
-            await self._restore_windows()
+        if server and self.tmux_server and server != self.tmux_server:
+            logger.info(
+                "tmux server changed (%s -> %s): restoring windows",
+                self.tmux_server,
+                server,
+            )
+            await self._restore_windows(server)
 
         windows = await tmux_manager.list_windows()
         live_by_name: dict[str, list[str]] = {}  # window_name -> [window_id, ...]
@@ -416,6 +428,10 @@ class SessionManager:
                         changed = True
             self.user_window_offsets[uid] = new_offsets
 
+        if server and self.tmux_server != server:
+            self.tmux_server = server
+            changed = True
+
         if changed:
             self._save_state()
             logger.info("Startup re-resolution complete")
@@ -424,18 +440,23 @@ class SessionManager:
         await self.sweep_stale_session_map_entries()
         await self._cleanup_old_format_session_map_keys()
 
-    async def _restore_windows(self) -> None:
+    async def _restore_windows(self, server: str) -> None:
         """Recreate every persisted Claude window after the tmux server died.
 
         Every persisted window ID belongs to the dead server. Each window_state
-        with a session_id (except the main placeholder) gets a new window at
-        its cwd running ``claude --resume``, and window_states, thread_bindings,
+        with a session_id and cwd (except the main placeholder) gets a new
+        window at its cwd running ``claude --resume``, and window_states, thread_bindings,
         user_window_offsets and window_display_names move to the new IDs by
         exact old->new mapping — never by name, which is ambiguous for windows
         sharing a name. Anything keyed by a dead ID with no new window is
         dropped: a fresh server reuses low IDs, so keeping it could cross-wire
         it onto an unrelated restored window. A turn that was mid-flight comes
         back idle; the conversation itself is in the transcript.
+
+        The remap and the new ``server`` identity are saved together, so a
+        crash before that save restores again on the next start (possibly
+        leaving untracked duplicate windows) instead of falling back to
+        name-based re-resolution against the reused IDs.
         """
 
         # The dead server's window-id keys must go before any restored
@@ -466,7 +487,7 @@ class SessionManager:
         for old_id in dead:
             ws = self.window_states[old_id]
             name = self.window_display_names.get(old_id, ws.window_name)
-            if not ws.session_id or name == config.tmux_main_window_name:
+            if not ws.session_id or not ws.cwd or name == config.tmux_main_window_name:
                 continue
             ok, message, new_name, new_id = await tmux_manager.create_window(
                 ws.cwd, window_name=name or None, resume_session_id=ws.session_id
@@ -506,6 +527,7 @@ class SessionManager:
             self.user_window_offsets[uid] = {
                 remap[wid]: off for wid, off in offsets.items() if wid in remap
             }
+        self.tmux_server = server
         self._save_state()
 
         if not resumed:
@@ -634,6 +656,46 @@ class SessionManager:
             return bool(old_keys)
 
         await asyncio.to_thread(self._locked_session_map_update, mutate)
+
+    async def live_window_ids(self) -> set[str] | None:
+        """Window IDs alive on the server that issued the persisted IDs.
+
+        None means "unknown": the server can't be queried, or it is not the
+        server the persisted IDs came from (it died and another started), so
+        absence from its windows says nothing about them. Callers must never
+        treat None as "no windows".
+        """
+        live_ids = await tmux_manager.list_all_window_ids()
+        if live_ids is None:
+            return None
+        server = await tmux_manager.server_identity()
+        if not server or (self.tmux_server and server != self.tmux_server):
+            return None
+        return live_ids
+
+    async def sweep_dead_window_states(self) -> None:
+        """Drop window_states whose tmux window is gone.
+
+        Keeps window_states equal to the windows alive on the server, which is
+        exactly the set _restore_windows brings back after the server dies —
+        so a window killed by /kill, a deleted topic or an exited shell isn't
+        resurrected. Pinned entries go too: a pin protects a live window
+        waiting for its hook, not a dead one. Skipped while live_window_ids
+        is unknown. Runs from the maintenance loop.
+        """
+        live_ids = await self.live_window_ids()
+        if live_ids is None:
+            return
+        dead = [
+            wid
+            for wid in self.window_states
+            if self._is_window_id(wid) and wid not in live_ids
+        ]
+        for wid in dead:
+            del self.window_states[wid]
+            logger.info("Removed dead window_state: %s", wid)
+        if dead:
+            self._save_state()
 
     async def sweep_stale_session_map_entries(self) -> None:
         """Remove entries for tmux windows that no longer exist on the socket.

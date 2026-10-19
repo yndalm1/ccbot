@@ -184,11 +184,6 @@ class TmuxManager:
         # interactive-UI button press) can't interleave their keystrokes and
         # Enter presses (RC11 / f37).
         self._send_locks: dict[str, asyncio.Lock] = {}
-        # True once get_or_create_session has created the session itself
-        # instead of finding it running. Read at startup: a session ccbot had
-        # to create means the tmux server died (typically a reboot), so every
-        # persisted window ID is dead and its windows need restoring.
-        self.created_session = False
 
     @property
     def server(self) -> libtmux.Server:
@@ -262,7 +257,6 @@ class TmuxManager:
             session_name=self.session_name,
             start_directory=str(Path.home()),
         )
-        self.created_session = True
         # Rename the default window to the main window name
         if session.windows:
             session.windows[0].rename_window(config.tmux_main_window_name)
@@ -359,6 +353,34 @@ class TmuxManager:
             )
             return None
         return {ln.strip() for ln in stdout.decode("utf-8").splitlines() if ln.strip()}
+
+    async def server_identity(self) -> str | None:
+        """Identity of the running tmux server as "<pid>:<start_time>".
+
+        Window IDs are only meaningful on the server that issued them, so a
+        persisted identity that differs from this one means every persisted
+        window ID is dead. Returns None when the server can't be queried.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._tmux_argv("display-message", "-p", "#{pid}:#{start_time}"),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_TMUX_SUBPROCESS_TIMEOUT
+            )
+        except Exception as e:
+            logger.debug("server_identity failed: %s", e)
+            return None
+        if proc.returncode != 0:
+            logger.debug(
+                "server_identity failed (rc=%s): %s",
+                proc.returncode,
+                stderr.decode("utf-8", "replace").strip(),
+            )
+            return None
+        return stdout.decode("utf-8").strip() or None
 
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.

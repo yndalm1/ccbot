@@ -779,3 +779,45 @@ class TestTurnEndFooter:
             footer.assert_not_called()
         _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
         footer.assert_called_once()
+
+
+class TestStaleBindingCleanup:
+    """status_poll_loop unbinds a topic whose window is gone only when the
+    live window IDs are known. Unknown (server unreachable, or replaced by a
+    new one) is not "window gone": the binding must survive so a restore on
+    ccbot's next start can carry it over."""
+
+    @staticmethod
+    async def _one_cycle(live_ids) -> MagicMock:
+        import asyncio
+
+        from ccbot.handlers.status_polling import status_poll_loop
+
+        sm = MagicMock()
+        sm.iter_thread_bindings.return_value = [(100, 5, "@7")]
+        sm.live_window_ids = AsyncMock(return_value=live_ids)
+        bot = MagicMock()
+        bot.reopen_forum_topic = AsyncMock()
+        with (
+            patch("ccbot.handlers.status_polling.session_manager", sm),
+            patch("ccbot.handlers.status_polling.tmux_manager") as tmux,
+            patch("ccbot.handlers.status_polling.clear_topic_state", AsyncMock()),
+            patch(
+                "ccbot.handlers.status_polling.asyncio.sleep",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ),
+        ):
+            tmux.find_window_by_id = AsyncMock(return_value=None)
+            with pytest.raises(asyncio.CancelledError):
+                await status_poll_loop(bot)
+        return sm
+
+    @pytest.mark.asyncio
+    async def test_unknown_live_ids_keep_binding(self) -> None:
+        sm = await self._one_cycle(None)
+        sm.unbind_thread.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_known_live_ids_unbind_gone_window(self) -> None:
+        sm = await self._one_cycle({"@1"})
+        sm.unbind_thread.assert_called_once_with(100, 5)

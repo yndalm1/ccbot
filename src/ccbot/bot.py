@@ -2157,9 +2157,9 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(bot_commands)
 
     # Re-resolve stale window IDs from persisted state against live tmux
-    # windows; if main() had to create the tmux session, the server died
-    # (e.g. a reboot), so restore the persisted windows with --resume first.
-    await session_manager.resolve_stale_ids(restore=tmux_manager.created_session)
+    # windows; if the tmux server differs from the one that issued them (e.g.
+    # after a reboot), restore the persisted windows with --resume first.
+    await session_manager.resolve_stale_ids(server=await tmux_manager.server_identity())
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
