@@ -343,6 +343,7 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     w = await tmux_manager.find_window_by_id(wid)
     if w:
         await tmux_manager.kill_window(w.window_id)
+        session_manager.forget_window(w.window_id)
         logger.info(
             "Killed window %s via /kill (user=%d, thread=%d)",
             display,
@@ -638,6 +639,7 @@ async def topic_closed_handler(
         w = await tmux_manager.find_window_by_id(wid)
         if w:
             await tmux_manager.kill_window(w.window_id)
+            session_manager.forget_window(w.window_id)
             logger.info(
                 "Topic closed: killed window %s (user=%d, thread=%d)",
                 display,
@@ -1425,40 +1427,14 @@ async def _create_and_bind_window(
                 hook_timeout,
             )
 
-        # --resume creates a new session_id in the hook, but messages continue
-        # writing to the resumed session's JSONL file. Override window_state to
-        # track the original session_id so the monitor can route messages back.
         if resume_session_id:
-            ws = session_manager.get_window_state(created_wid)
-            if not hook_ok:
-                # Hook timed out — manually populate window_state so the
-                # monitor can still route messages back to this topic. Pin
-                # over "" so ANY future hook entry with a non-empty, different
-                # session_id unpins (the hook-sync loop must not revert this).
-                logger.warning(
-                    "Hook timed out for resume window %s, "
-                    "manually setting session_id=%s cwd=%s",
-                    created_wid,
-                    resume_session_id,
-                    selected_path,
-                )
-                ws.session_id = resume_session_id
-                ws.cwd = str(selected_path)
-                ws.window_name = created_wname
-                ws.pinned_over = ""
-                session_manager._save_state()
-            elif ws.session_id != resume_session_id:
-                logger.info(
-                    "Resume override: window %s session_id %s -> %s",
-                    created_wid,
-                    ws.session_id,
-                    resume_session_id,
-                )
-                # Pin over the hook-reported sid being outranked so the
-                # hook-sync loop doesn't revert this override on its next poll.
-                ws.pinned_over = ws.session_id
-                ws.session_id = resume_session_id
-                session_manager._save_state()
+            session_manager.pin_resumed_session(
+                created_wid,
+                resume_session_id,
+                str(selected_path),
+                created_wname,
+                hook_ok,
+            )
 
         # Pin the version that's running in this window so future turn-ends
         # can detect a binary upgrade just for THIS window. Per-window means
@@ -2182,8 +2158,10 @@ async def post_init(application: Application) -> None:
 
     await application.bot.set_my_commands(bot_commands)
 
-    # Re-resolve stale window IDs from persisted state against live tmux windows
-    await session_manager.resolve_stale_ids()
+    # Re-resolve stale window IDs from persisted state against live tmux
+    # windows; if the tmux server differs from the one that issued them (e.g.
+    # after a reboot), restore the persisted windows with --resume first.
+    await session_manager.resolve_stale_ids(server=await tmux_manager.server_identity())
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's

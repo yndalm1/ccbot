@@ -256,6 +256,7 @@ async def status_poll_loop(bot: Bot) -> None:
                             w = await tmux_manager.find_window_by_id(wid)
                             if w:
                                 await tmux_manager.kill_window(w.window_id)
+                                session_manager.forget_window(w.window_id)
                             session_manager.unbind_thread(user_id, thread_id)
                             await clear_topic_state(user_id, thread_id, bot)
                             logger.info(
@@ -278,11 +279,18 @@ async def status_poll_loop(bot: Bot) -> None:
                             e,
                         )
 
-            for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
+            bindings = list(session_manager.iter_thread_bindings())
+            # Unknown live IDs (server unreachable, or not the server that
+            # issued the bound IDs) are not "window gone": keep the bindings
+            # so a restore on ccbot's next start can carry them over.
+            live_ids = await session_manager.live_window_ids() if bindings else None
+            for user_id, thread_id, wid in bindings:
                 try:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
+                        if live_ids is None:
+                            continue
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
