@@ -343,6 +343,7 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     w = await tmux_manager.find_window_by_id(wid)
     if w:
         await tmux_manager.kill_window(w.window_id)
+        session_manager.forget_window(w.window_id)
         logger.info(
             "Killed window %s via /kill (user=%d, thread=%d)",
             display,
@@ -638,6 +639,7 @@ async def topic_closed_handler(
         w = await tmux_manager.find_window_by_id(wid)
         if w:
             await tmux_manager.kill_window(w.window_id)
+            session_manager.forget_window(w.window_id)
             logger.info(
                 "Topic closed: killed window %s (user=%d, thread=%d)",
                 display,

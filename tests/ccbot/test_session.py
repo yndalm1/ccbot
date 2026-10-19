@@ -765,10 +765,12 @@ class TestResolveStaleIdsRestore:
         """Fake a fresh tmux server: create_window hands out @1, @2, ... and
         de-duplicates names the way TmuxManager.create_window does. ``hook``
         (window_id, resume_session_id) runs per created window, standing in
-        for Claude's SessionStart hook."""
+        for Claude's SessionStart hook. Created windows carry their
+        RESUME_OPTION tag, listed by list_resumed_windows."""
         from ccbot.tmux_manager import TmuxWindow
 
         live: list[TmuxWindow] = []
+        tags: dict[str, str] = {}  # window_id -> resumed session_id
 
         async def create_window(work_dir, window_name=None, resume_session_id=None):
             name = window_name or "w"
@@ -777,6 +779,8 @@ class TestResolveStaleIdsRestore:
                 name, n = f"{base}-{n}", n + 1
             wid = f"@{len(live) + 1}"
             live.append(TmuxWindow(window_id=wid, window_name=name, cwd=work_dir))
+            if resume_session_id:
+                tags[wid] = resume_session_id
             if hook:
                 hook(wid, resume_session_id)
             return True, "ok", name, wid
@@ -794,6 +798,16 @@ class TestResolveStaleIdsRestore:
         monkeypatch.setattr(
             "ccbot.session.tmux_manager.list_group_session_names",
             AsyncMock(return_value={config.tmux_session_name}),
+        )
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_resumed_windows",
+            AsyncMock(
+                side_effect=lambda: {
+                    tags[w.window_id]: (w.window_id, w.window_name)
+                    for w in live
+                    if w.window_id in tags
+                }
+            ),
         )
         monkeypatch.setattr(
             "ccbot.update_watcher.current_claude_version",
@@ -1041,11 +1055,59 @@ class TestResolveStaleIdsRestore:
 
         await mgr.resolve_stale_ids(server=self.NEW)
 
+        # The window the interrupted run created for "api" is adopted, not
+        # duplicated: one window per session in total.
+        assert create.await_count == 3  # api, (crash), web
         api = mgr.get_window_for_thread(100, 5)
         web = mgr.get_window_for_thread(100, 6)
+        assert (api, web) == ("@1", "@2")
         assert mgr.window_states[api].session_id == "sid-api"
         assert mgr.window_states[web].session_id == "sid-web"
         assert mgr.tmux_server == self.NEW
+
+    @pytest.mark.asyncio
+    async def test_adopted_window_keeps_its_hook_entry(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """An adoptable window lives on this server, so its session_map entry
+        is its own hook's and must survive the dead-key clear."""
+        live, _ = self._mock_tmux(monkeypatch)
+        from ccbot.tmux_manager import TmuxWindow
+
+        live.append(TmuxWindow(window_id="@1", window_name="api", cwd="/proj"))
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_resumed_windows",
+            AsyncMock(return_value={"sid-api": ("@1", "api")}),
+        )
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@1": {"session_id": "sid-api", "cwd": "/proj"},
+                    "ccbot:@9": {"session_id": "dead-sid", "cwd": "/old"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        self._no_hook(monkeypatch, mgr)
+        self._persist(mgr, "@2", "api", "sid-api")
+
+        await mgr.resolve_stale_ids(server=self.NEW)
+
+        assert set(json.loads(session_map_file.read_text())) == {"ccbot:@1"}
+        assert mgr.window_states["@1"].session_id == "sid-api"
+
+
+class TestForgetWindow:
+    def test_drops_state_of_killed_window(self, mgr: SessionManager) -> None:
+        mgr.get_window_state("@1").session_id = "killed"
+        mgr.get_window_state("@2").session_id = "kept"
+
+        mgr.forget_window("@1")
+        mgr.forget_window("@99")  # unknown: no-op
+
+        assert set(mgr.window_states) == {"@2"}
 
 
 class TestSweepDeadWindowStates:

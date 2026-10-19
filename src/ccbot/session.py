@@ -454,20 +454,26 @@ class SessionManager:
         back idle; the conversation itself is in the transcript.
 
         The remap and the new ``server`` identity are saved together, so a
-        crash before that save restores again on the next start (possibly
-        leaving untracked duplicate windows) instead of falling back to
-        name-based re-resolution against the reused IDs.
+        crash before that save restores again on the next start instead of
+        falling back to name-based re-resolution against the reused IDs. That
+        repeat adopts the windows the interrupted run already created (tagged
+        with the session they resume) rather than creating duplicates.
         """
+        adoptable = await tmux_manager.list_resumed_windows() or {}
+        adopted_ids = {wid for wid, _ in adoptable.values()}
 
         # The dead server's window-id keys must go before any restored
         # window's SessionStart hook writes, so a reused ID can't surface a
-        # dead window's session.
+        # dead window's session. Adoptable windows live on this server, so
+        # their keys are their own hooks' and stay.
         def drop_window_keys(session_map: dict[str, Any]) -> bool:
             dead_keys = [
                 key
                 for key in session_map
                 for parts in [self._split_session_map_key(key)]
-                if parts is not None and self._is_window_id(parts[1])
+                if parts is not None
+                and self._is_window_id(parts[1])
+                and parts[1] not in adopted_ids
             ]
             for key in dead_keys:
                 del session_map[key]
@@ -488,6 +494,20 @@ class SessionManager:
             ws = self.window_states[old_id]
             name = self.window_display_names.get(old_id, ws.window_name)
             if not ws.session_id or not ws.cwd or name == config.tmux_main_window_name:
+                continue
+            if ws.session_id in adoptable:
+                new_id, new_name = adoptable.pop(ws.session_id)
+                logger.info(
+                    "Adopted window %s for %s (session %s)",
+                    new_id,
+                    old_id,
+                    ws.session_id,
+                )
+                remap[old_id] = new_id
+                resumed[new_id] = (ws.session_id, ws.cwd, new_name)
+                ws.window_name = new_name
+                ws.pinned_over = ""
+                restored[new_id] = ws
                 continue
             ok, message, new_name, new_id = await tmux_manager.create_window(
                 ws.cwd, window_name=name or None, resume_session_id=ws.session_id
@@ -961,6 +981,13 @@ class SessionManager:
         if window_id not in self.window_states:
             self.window_states[window_id] = WindowState()
         return self.window_states[window_id]
+
+    def forget_window(self, window_id: str) -> None:
+        """Drop the state of a window ccbot just killed (/kill, topic closed
+        or deleted), so a restore before the next window_state sweep can't
+        resurrect it."""
+        if self.window_states.pop(window_id, None) is not None:
+            self._save_state()
 
     def clear_window_session(self, window_id: str) -> None:
         """Clear session association for a window (e.g., after /clear command)."""

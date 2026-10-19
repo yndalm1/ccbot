@@ -53,6 +53,11 @@ _FALLBACK_PATH = "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 # can't pin a thread-pool thread (and hang /restart) indefinitely.
 _TMUX_SUBPROCESS_TIMEOUT = 10.0
 
+# tmux window option naming the session a window was created to --resume.
+# Lets a restore interrupted after creating a window adopt it on the next
+# start instead of creating a duplicate.
+RESUME_OPTION = "@ccbot_resume"
+
 # Verify-before-Enter: number of capture-pane polls used to confirm literal
 # text actually landed in the pane before submitting Enter, and the spacing
 # between them. A wedged/slow-redrawing TUI would otherwise turn a
@@ -353,6 +358,40 @@ class TmuxManager:
             )
             return None
         return {ln.strip() for ln in stdout.decode("utf-8").splitlines() if ln.strip()}
+
+    async def list_resumed_windows(self) -> dict[str, tuple[str, str]] | None:
+        """session_id -> (window_id, window_name) for windows in ccbot's tmux
+        session that were created with --resume (tagged RESUME_OPTION).
+
+        Returns None when tmux can't be queried.
+        """
+        fmt = "#{window_id}\t#{window_name}\t#{%s}" % RESUME_OPTION
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._tmux_argv("list-windows", "-t", self.session_name, "-F", fmt),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_TMUX_SUBPROCESS_TIMEOUT
+            )
+        except Exception as e:
+            logger.debug("list_resumed_windows failed: %s", e)
+            return None
+        if proc.returncode != 0:
+            logger.debug(
+                "list_resumed_windows failed (rc=%s): %s",
+                proc.returncode,
+                stderr.decode("utf-8", "replace").strip(),
+            )
+            return None
+        resumed: dict[str, tuple[str, str]] = {}
+        for line in stdout.decode("utf-8").splitlines():
+            wid, _, rest = line.partition("\t")
+            name, _, sid = rest.partition("\t")
+            if wid and sid:
+                resumed[sid] = (wid, name)
+        return resumed
 
     async def server_identity(self) -> str | None:
         """Identity of the running tmux server as "<pid>:<start_time>".
@@ -931,6 +970,8 @@ class TmuxManager:
                 # Prevent Claude Code from overriding window name. Defense in
                 # depth — the global `allow-rename` is typically already off.
                 window.set_window_option("allow-rename", "off")
+                if resume_session_id:
+                    window.set_window_option(RESUME_OPTION, resume_session_id)
 
                 logger.info(
                     "Created window '%s' (id=%s) at %s",
